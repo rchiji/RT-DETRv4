@@ -20,6 +20,18 @@ from .det_engine import train_one_epoch, evaluate
 from ..optim.lr_scheduler import FlatCosineLRScheduler
 
 
+def _metric_to_scalar(metric) -> float:
+    if isinstance(metric, (list, tuple)):
+        if len(metric) == 0:
+            return 0.0
+        return float(metric[0])
+    if isinstance(metric, torch.Tensor):
+        if metric.numel() == 0:
+            return 0.0
+        return float(metric.reshape(-1)[0].item())
+    return float(metric)
+
+
 class DetSolver(BaseSolver):
 
     def fit(self, ):
@@ -54,9 +66,10 @@ class DetSolver(BaseSolver):
                 self.device
             )
             for k in test_stats:
+                metric_scalar = _metric_to_scalar(test_stats[k])
                 best_stat['epoch'] = self.last_epoch
-                best_stat[k] = test_stats[k][0]
-                top1 = test_stats[k][0]
+                best_stat[k] = metric_scalar
+                top1 = metric_scalar
                 print(f'best_stat: {best_stat}')
 
         best_stat_print = best_stat.copy()
@@ -160,16 +173,21 @@ class DetSolver(BaseSolver):
 
             # TODO
             for k in test_stats:
+                metric_value = test_stats[k]
+                metric_scalar = _metric_to_scalar(metric_value)
                 if self.writer and dist_utils.is_main_process():
-                    for i, v in enumerate(test_stats[k]):
-                        self.writer.add_scalar(f'Test/{k}_{i}'.format(k), v, epoch)
+                    if isinstance(metric_value, (list, tuple)):
+                        for i, v in enumerate(metric_value):
+                            self.writer.add_scalar(f'Test/{k}_{i}'.format(k), v, epoch)
+                    else:
+                        self.writer.add_scalar(f'Test/{k}'.format(k), metric_scalar, epoch)
 
                 if k in best_stat:
-                    best_stat['epoch'] = epoch if test_stats[k][0] > best_stat[k] else best_stat['epoch']
-                    best_stat[k] = max(best_stat[k], test_stats[k][0])
+                    best_stat['epoch'] = epoch if metric_scalar > best_stat[k] else best_stat['epoch']
+                    best_stat[k] = max(best_stat[k], metric_scalar)
                 else:
                     best_stat['epoch'] = epoch
-                    best_stat[k] = test_stats[k][0]
+                    best_stat[k] = metric_scalar
 
                 if best_stat[k] > top1:
                     best_stat_print['epoch'] = epoch
@@ -185,11 +203,11 @@ class DetSolver(BaseSolver):
 
                 if best_stat['epoch'] == epoch and self.output_dir:
                     if epoch >= self.train_dataloader.collate_fn.stop_epoch:
-                        if test_stats[k][0] > top1:
-                            top1 = test_stats[k][0]
+                        if metric_scalar > top1:
+                            top1 = metric_scalar
                             dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg2.pth')
                     else:
-                        top1 = max(test_stats[k][0], top1)
+                        top1 = max(metric_scalar, top1)
                         dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg1.pth')
 
                 elif epoch >= self.train_dataloader.collate_fn.stop_epoch:
