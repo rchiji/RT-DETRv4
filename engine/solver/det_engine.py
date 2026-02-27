@@ -177,11 +177,16 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, 
     # coco_evaluator = CocoEvaluator(base_ds, iou_types)
     # coco_evaluator.coco_eval[iou_types[0]].params.iouThrs = [0, 0.1, 0.5, 0.75]
 
-    for samples, targets in metric_logger.log_every(data_loader, 10, header):
+    for i, (samples, targets) in enumerate(metric_logger.log_every(data_loader, 10, header)):
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
         outputs = model(samples)
+        metas = dict(epoch=-1, step=i, global_step=i, epoch_step=len(data_loader))
+        loss_dict = criterion(outputs, targets, **metas)
+        loss_dict_reduced = dist_utils.reduce_dict(loss_dict)
+        loss_value = sum(loss_dict_reduced.values())
+        metric_logger.update(loss=loss_value, **loss_dict_reduced)
 
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
 
@@ -206,8 +211,7 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, 
         coco_evaluator.accumulate()
         coco_evaluator.summarize()
 
-    stats = {}
-    # stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
     if coco_evaluator is not None:
         if 'bbox' in iou_types:
             stats['coco_eval_bbox'] = coco_evaluator.coco_eval['bbox'].stats.tolist()
