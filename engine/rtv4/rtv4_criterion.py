@@ -337,8 +337,11 @@ class RTv4Criterion(nn.Module):
         self._clear_cache()
 
         # Get the matching union set across all decoder layers.
+        indices_go = indices
+        num_boxes_go = None
+        cached_indices, cached_indices_enc = [], []
         if 'aux_outputs' in outputs:
-            indices_aux_list, cached_indices, cached_indices_enc = [], [], []
+            indices_aux_list = []
             aux_outputs_list = outputs['aux_outputs']
             if 'pre_outputs' in outputs:
                 aux_outputs_list = outputs['aux_outputs'] + [outputs['pre_outputs']]
@@ -359,7 +362,10 @@ class RTv4Criterion(nn.Module):
                 torch.distributed.all_reduce(num_boxes_go)
             num_boxes_go = torch.clamp(num_boxes_go / get_world_size(), min=1).item()
         else:
-            assert 'aux_outputs' in outputs, ''
+            if 'enc_aux_outputs' in outputs:
+                for i, aux_outputs in enumerate(outputs['enc_aux_outputs']):
+                    indices_enc = self.matcher(aux_outputs, targets)['indices']
+                    cached_indices_enc.append(indices_enc)
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
         num_boxes = sum(len(t["labels"]) for t in targets)
@@ -367,6 +373,8 @@ class RTv4Criterion(nn.Module):
         if is_dist_available_and_initialized():
             torch.distributed.all_reduce(num_boxes)
         num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item()
+        if num_boxes_go is None:
+            num_boxes_go = num_boxes
 
         # Compute all the requested losses, main loss
         losses = {}
