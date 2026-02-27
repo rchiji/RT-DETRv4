@@ -486,6 +486,16 @@ class HGNetv2(nn.Module):
         if freeze_norm:
             self._freeze_norm(self)
 
+        def _dist_is_initialized() -> bool:
+            return torch.distributed.is_available() and torch.distributed.is_initialized()
+
+        def _is_rank0() -> bool:
+            return (not _dist_is_initialized()) or torch.distributed.get_rank() == 0
+
+        def _dist_barrier() -> None:
+            if _dist_is_initialized():
+                _dist_barrier()
+
         if pretrained:
             RED, GREEN, RESET = "\033[91m", "\033[92m", "\033[0m"
             try:
@@ -495,13 +505,13 @@ class HGNetv2(nn.Module):
                     print(f"Loaded stage1 {name} HGNetV2 from local file.")
                 else:
                     # If the file doesn't exist locally, download from the URL
-                    if torch.distributed.get_rank() == 0:
+                    if _is_rank0():
                         print(GREEN + "If the pretrained HGNetV2 can't be downloaded automatically. Please check your network connection." + RESET)
                         print(GREEN + "Please check your network connection. Or download the model manually from " + RESET + f"{download_url}" + GREEN + " to " + RESET + f"{local_model_dir}." + RESET)
                         state = torch.hub.load_state_dict_from_url(download_url, map_location='cpu', model_dir=local_model_dir)
-                        torch.distributed.barrier()
+                        _dist_barrier()
                     else:
-                        torch.distributed.barrier()
+                        _dist_barrier()
                         state = torch.load(local_model_dir)
 
                     print(f"Loaded stage1 {name} HGNetV2 from URL.")
@@ -509,7 +519,7 @@ class HGNetv2(nn.Module):
                 self.load_state_dict(state)
 
             except (Exception, KeyboardInterrupt) as e:
-                if torch.distributed.get_rank() == 0:
+                if _is_rank0():
                     print(f"{str(e)}")
                     logging.error(RED + "CRITICAL WARNING: Failed to load pretrained HGNetV2 model" + RESET)
                     logging.error(GREEN + "Please check your network connection. Or download the model manually from " \
