@@ -165,7 +165,6 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
 @torch.no_grad()
 def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, data_loader, coco_evaluator: CocoEvaluator, device):
     model.eval()
-    criterion.eval()
     coco_evaluator.cleanup()
 
     metric_logger = MetricLogger(delimiter="  ")
@@ -182,11 +181,6 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, 
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
         outputs = model(samples)
-        metas = dict(epoch=-1, step=i, global_step=i, epoch_step=len(data_loader))
-        loss_dict = criterion(outputs, targets, **metas)
-        loss_dict_reduced = dist_utils.reduce_dict(loss_dict)
-        loss_value = sum(loss_dict_reduced.values())
-        metric_logger.update(loss=loss_value, **loss_dict_reduced)
 
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
 
@@ -202,7 +196,10 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, 
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
-    print("Averaged stats:", metric_logger)
+    if len(metric_logger.meters) > 0:
+        print("Averaged stats:", metric_logger)
+    else:
+        print("Averaged stats: (COCO metrics only)")
     if coco_evaluator is not None:
         coco_evaluator.synchronize_between_processes()
 
