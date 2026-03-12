@@ -55,6 +55,14 @@ def crop(image, target, region):
         target["area"] = area
         fields.append("boxes")
 
+    if "ignore_boxes" in target:
+        ignore_boxes = target["ignore_boxes"]
+        max_size = torch.as_tensor([w, h], dtype=torch.float32)
+        cropped_ignore_boxes = ignore_boxes - torch.as_tensor([j, i, j, i])
+        cropped_ignore_boxes = torch.min(cropped_ignore_boxes.reshape(-1, 2, 2), max_size)
+        cropped_ignore_boxes = cropped_ignore_boxes.clamp(min=0)
+        target["ignore_boxes"] = cropped_ignore_boxes.reshape(-1, 4)
+
     if "masks" in target:
         # FIXME should we update the area here if there are no boxes?
         target['masks'] = target['masks'][:, i:i + h, j:j + w]
@@ -73,6 +81,11 @@ def crop(image, target, region):
         for field in fields:
             target[field] = target[field][keep]
 
+    if "ignore_boxes" in target:
+        cropped_ignore_boxes = target["ignore_boxes"].reshape(-1, 2, 2)
+        keep_ignore = torch.all(cropped_ignore_boxes[:, 1, :] > cropped_ignore_boxes[:, 0, :], dim=1)
+        target["ignore_boxes"] = target["ignore_boxes"][keep_ignore]
+
     return cropped_image, target
 
 
@@ -86,6 +99,11 @@ def hflip(image, target):
         boxes = target["boxes"]
         boxes = boxes[:, [2, 1, 0, 3]] * torch.as_tensor([-1, 1, -1, 1]) + torch.as_tensor([w, 0, w, 0])
         target["boxes"] = boxes
+
+    if "ignore_boxes" in target:
+        ignore_boxes = target["ignore_boxes"]
+        ignore_boxes = ignore_boxes[:, [2, 1, 0, 3]] * torch.as_tensor([-1, 1, -1, 1]) + torch.as_tensor([w, 0, w, 0])
+        target["ignore_boxes"] = ignore_boxes
 
     if "masks" in target:
         target['masks'] = target['masks'].flip(-1)
@@ -140,6 +158,11 @@ def resize(image, target, size, max_size=None):
         boxes = target["boxes"]
         scaled_boxes = boxes * torch.as_tensor([ratio_width, ratio_height, ratio_width, ratio_height])
         target["boxes"] = scaled_boxes
+
+    if "ignore_boxes" in target:
+        ignore_boxes = target["ignore_boxes"]
+        scaled_ignore_boxes = ignore_boxes * torch.as_tensor([ratio_width, ratio_height, ratio_width, ratio_height])
+        target["ignore_boxes"] = scaled_ignore_boxes
 
     if "area" in target:
         area = target["area"]

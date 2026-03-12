@@ -99,6 +99,8 @@ class Mosaic(T.Transform):
 
             merged_image.paste(img, placement_offsets[i])
             target['boxes'] = target['boxes'] + offsets[i]
+            if 'ignore_boxes' in target:
+                target['ignore_boxes'] = target['ignore_boxes'] + offsets[i]
             mosaic_target.append(target)
 
         merged_target = {}
@@ -118,7 +120,7 @@ class Mosaic(T.Transform):
         offsets = torch.tensor([[0, 0], [max_width, 0], [0, max_height], [max_width, max_height]]).repeat(1, 2)
         merged_target = {}
         for key in targets[0]:
-            if key == 'boxes':
+            if key in ('boxes', 'ignore_boxes'):
                 values = [target[key] + offsets[i] for i, target in enumerate(targets)]
             else:
                 values = [target[key] for target in targets]
@@ -159,6 +161,13 @@ class Mosaic(T.Transform):
         if 'boxes' in mosaic_target:
             mosaic_target['boxes'] = convert_to_tv_tensor(mosaic_target['boxes'], 'boxes', box_format='xyxy',
                                                           spatial_size=mosaic_image.size[::-1])
+        if 'ignore_boxes' in mosaic_target:
+            mosaic_target['ignore_boxes'] = convert_to_tv_tensor(
+                mosaic_target['ignore_boxes'],
+                'ignore_boxes',
+                box_format='xyxy',
+                spatial_size=mosaic_image.size[::-1]
+            )
         if 'masks' in mosaic_target:
             mosaic_target['masks'] = convert_to_tv_tensor(mosaic_target['masks'], 'masks')
 

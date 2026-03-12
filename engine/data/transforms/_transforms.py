@@ -88,8 +88,26 @@ class RandomIoUCrop(T.RandomIoUCrop):
         self.p = p
 
     def __call__(self, *inputs: Any) -> Any:
+        sample = inputs if len(inputs) > 1 else inputs[0]
+
+        # torchvision RandomIoUCrop assumes a single bbox set. Our target may
+        # include an additional bbox field (`ignore_boxes`) with a different
+        # length, which can trigger shape-mismatch indexing inside torchvision.
+        # Skip IoUCrop for such samples and keep other augmentations enabled.
+        target = None
+        if isinstance(sample, (tuple, list)) and len(sample) >= 2 and isinstance(sample[1], dict):
+            target = sample[1]
+        elif len(inputs) >= 2 and isinstance(inputs[1], dict):
+            target = inputs[1]
+
+        # With multiple bbox fields in target (e.g. `boxes` + `ignore_boxes`),
+        # torchvision RandomIoUCrop can mismatch boolean masks between fields.
+        # Skip IoUCrop whenever ignore-box bookkeeping exists.
+        if target is not None and "ignore_boxes" in target:
+            return sample
+
         if torch.rand(1) >= self.p:
-            return inputs if len(inputs) > 1 else inputs[0]
+            return sample
 
         return super().forward(*inputs)
 

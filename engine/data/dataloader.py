@@ -154,6 +154,11 @@ class BatchImageCollateFunction(BaseCollateFunction):
                 updated_targets[i]['boxes'] = torch.cat([targets[i]['boxes'], shifted_targets[i]['boxes']], dim=0)
                 updated_targets[i]['labels'] = torch.cat([targets[i]['labels'], shifted_targets[i]['labels']], dim=0)
                 updated_targets[i]['area'] = torch.cat([targets[i]['area'], shifted_targets[i]['area']], dim=0)
+                if 'ignore_boxes' in targets[i] and 'ignore_boxes' in shifted_targets[i]:
+                    updated_targets[i]['ignore_boxes'] = torch.cat(
+                        [targets[i]['ignore_boxes'], shifted_targets[i]['ignore_boxes']],
+                        dim=0
+                    )
 
                 # Add mixup ratio to targets
                 updated_targets[i]['mixup'] = torch.tensor(

@@ -59,6 +59,13 @@ class CocoDetection(torchvision.datasets.CocoDetection, DetDataset):
         if 'boxes' in target:
             target['boxes'] = convert_to_tv_tensor(target['boxes'], key='boxes', spatial_size=image.size[::-1])
 
+        if 'ignore_boxes' in target:
+            target['ignore_boxes'] = convert_to_tv_tensor(
+                target['ignore_boxes'],
+                key='ignore_boxes',
+                spatial_size=image.size[::-1]
+            )
+
         if 'masks' in target:
             target['masks'] = convert_to_tv_tensor(target['masks'], key='masks')
 
@@ -118,8 +125,13 @@ class ConvertCocoPolysToMask(object):
         image_id = torch.tensor([image_id])
 
         anno = target["annotations"]
+        anno_ignore = [obj for obj in anno if obj.get('iscrowd', 0) == 1 or obj.get('ignore', 0) == 1]
 
-        anno = [obj for obj in anno if 'iscrowd' not in obj or obj['iscrowd'] == 0]
+        anno = [
+            obj
+            for obj in anno
+            if (obj.get('iscrowd', 0) == 0 and obj.get('ignore', 0) == 0)
+        ]
 
         boxes = [obj["bbox"] for obj in anno]
         # guard against no boxes via resizing
@@ -156,9 +168,18 @@ class ConvertCocoPolysToMask(object):
         if keypoints is not None:
             keypoints = keypoints[keep]
 
+        ignore_boxes = [obj["bbox"] for obj in anno_ignore]
+        ignore_boxes = torch.as_tensor(ignore_boxes, dtype=torch.float32).reshape(-1, 4)
+        ignore_boxes[:, 2:] += ignore_boxes[:, :2]
+        ignore_boxes[:, 0::2].clamp_(min=0, max=w)
+        ignore_boxes[:, 1::2].clamp_(min=0, max=h)
+        keep_ignore = (ignore_boxes[:, 3] > ignore_boxes[:, 1]) & (ignore_boxes[:, 2] > ignore_boxes[:, 0])
+        ignore_boxes = ignore_boxes[keep_ignore]
+
         target = {}
         target["boxes"] = boxes
         target["labels"] = labels
+        target["ignore_boxes"] = ignore_boxes
         if self.return_masks:
             target["masks"] = masks
         target["image_id"] = image_id
