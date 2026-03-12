@@ -1,0 +1,8 @@
+__include__: [
+  './deim_hgnetv2_s_coco.yml'
+]
+
+# Person-only detection setting.
+num_classes: 1
+remap_mscoco_category: True
+
