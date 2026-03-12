@@ -27,7 +27,9 @@ class ClasSolver(BaseSolver):
         print('Number of params:', n_parameters)
 
         output_dir = Path(args.output_dir)
-        output_dir.mkdir(exist_ok=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        checkpoint_dir = output_dir / "checkpoints"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         start_time = time.time()
         start_epoch = self.last_epoch + 1
@@ -47,10 +49,10 @@ class ClasSolver(BaseSolver):
             self.last_epoch += 1
 
             if output_dir:
-                checkpoint_paths = [output_dir / 'checkpoint.pth']
+                checkpoint_paths = [checkpoint_dir / 'checkpoint.pth']
                 # extra checkpoint before LR drop and every 100 epochs
                 if (epoch + 1) % args.checkpoint_freq == 0:
-                    checkpoint_paths.append(output_dir / f'checkpoint{epoch:04}.pth')
+                    checkpoint_paths.append(checkpoint_dir / f'checkpoint{epoch:04}.pth')
                 for checkpoint_path in checkpoint_paths:
                     dist_utils.save_on_master(self.state_dict(epoch), checkpoint_path)
 
