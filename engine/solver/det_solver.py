@@ -37,6 +37,15 @@ class DetSolver(BaseSolver):
     def fit(self, ):
         self.train()
         args = self.cfg
+        checkpoint_dir = None
+        if self.output_dir:
+            checkpoint_dir = self.output_dir / "checkpoints"
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        def _checkpoint_target(name: str):
+            if checkpoint_dir is not None:
+                return checkpoint_dir / name
+            return name
 
         n_parameters, model_stats = stats(self.cfg)
         print(model_stats)
@@ -83,7 +92,7 @@ class DetSolver(BaseSolver):
                 self.train_dataloader.sampler.set_epoch(epoch)
 
             if epoch == self.train_dataloader.collate_fn.stop_epoch:
-                self.load_resume_state(str(self.output_dir / 'best_stg1.pth'))
+                self.load_resume_state(str(_checkpoint_target('best_stg1.pth')))
                 self.ema.decay = self.train_dataloader.collate_fn.ema_restart_decay
                 print(f'Refresh EMA at epoch {epoch} with decay {self.ema.decay}')
 
@@ -154,10 +163,10 @@ class DetSolver(BaseSolver):
                 print(f"Epoch {epoch}: avg encoder grad {avg_percentage:.2f}% | distill {current_weight:.6f} -> {new_weight:.6f} ({reason})")
 
             if self.output_dir and epoch < self.train_dataloader.collate_fn.stop_epoch:
-                checkpoint_paths = [self.output_dir / 'last.pth']
+                checkpoint_paths = [_checkpoint_target('last.pth')]
                 # extra checkpoint before LR drop and every 100 epochs
                 if (epoch + 1) % args.checkpoint_freq == 0:
-                    checkpoint_paths.append(self.output_dir / f'checkpoint{epoch:04}.pth')
+                    checkpoint_paths.append(_checkpoint_target(f'checkpoint{epoch:04}.pth'))
                 for checkpoint_path in checkpoint_paths:
                     dist_utils.save_on_master(self.state_dict(), checkpoint_path)
 
@@ -194,9 +203,9 @@ class DetSolver(BaseSolver):
                     top1 = best_stat[k]
                     if self.output_dir:
                         if epoch >= self.train_dataloader.collate_fn.stop_epoch:
-                            dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg2.pth')
+                            dist_utils.save_on_master(self.state_dict(), _checkpoint_target('best_stg2.pth'))
                         else:
-                            dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg1.pth')
+                            dist_utils.save_on_master(self.state_dict(), _checkpoint_target('best_stg1.pth'))
 
                 best_stat_print[k] = max(best_stat[k], top1)
                 print(f'best_stat: {best_stat_print}')  # global best
@@ -205,15 +214,15 @@ class DetSolver(BaseSolver):
                     if epoch >= self.train_dataloader.collate_fn.stop_epoch:
                         if metric_scalar > top1:
                             top1 = metric_scalar
-                            dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg2.pth')
+                            dist_utils.save_on_master(self.state_dict(), _checkpoint_target('best_stg2.pth'))
                     else:
                         top1 = max(metric_scalar, top1)
-                        dist_utils.save_on_master(self.state_dict(), self.output_dir / 'best_stg1.pth')
+                        dist_utils.save_on_master(self.state_dict(), _checkpoint_target('best_stg1.pth'))
 
                 elif epoch >= self.train_dataloader.collate_fn.stop_epoch:
                     best_stat = {'epoch': -1, }
                     self.ema.decay -= 0.0001
-                    self.load_resume_state(str(self.output_dir / 'best_stg1.pth'))
+                    self.load_resume_state(str(_checkpoint_target('best_stg1.pth')))
                     print(f'Refresh EMA at epoch {epoch} with decay {self.ema.decay}')
 
 
