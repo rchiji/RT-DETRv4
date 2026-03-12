@@ -39,6 +39,35 @@ def _compute_encoder_transformer_grad_percentage(model: torch.nn.Module) -> floa
     return 100.0 * enc_l1 / total_l1
 
 
+def _collect_sparse_debug_stats(criterion: torch.nn.Module, device: torch.device):
+    if not hasattr(criterion, 'pop_sparse_debug_stats'):
+        return {}
+    raw = criterion.pop_sparse_debug_stats()
+    if not isinstance(raw, dict):
+        return {}
+
+    out = {}
+    for k, v in raw.items():
+        if not isinstance(k, str):
+            continue
+        if not k.startswith('loss_sparse_'):
+            continue
+        if isinstance(v, torch.Tensor):
+            value = v.detach()
+            if value.numel() != 1:
+                value = value.float().mean()
+            out[k] = value
+            continue
+        try:
+            value_f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(value_f):
+            continue
+        out[k] = torch.tensor(value_f, dtype=torch.float32, device=device)
+    return out
+
+
 def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0, **kwargs):
@@ -140,6 +169,8 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
                 lr_warmup_scheduler.step()
 
         loss_dict_reduced = dist_utils.reduce_dict(loss_dict)
+        sparse_debug_dict = _collect_sparse_debug_stats(criterion, device=device)
+        sparse_debug_reduced = dist_utils.reduce_dict(sparse_debug_dict) if sparse_debug_dict else {}
         loss_value = sum(loss_dict_reduced.values())
 
         if not math.isfinite(loss_value):
@@ -147,7 +178,7 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
             print(loss_dict_reduced)
             sys.exit(1)
 
-        metric_logger.update(loss=loss_value, **loss_dict_reduced)
+        metric_logger.update(loss=loss_value, **loss_dict_reduced, **sparse_debug_reduced)
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
         if writer and dist_utils.is_main_process() and global_step % 10 == 0:
@@ -156,6 +187,8 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
                 writer.add_scalar(f'Lr/pg_{j}', pg['lr'], global_step)
             for k, v in loss_dict_reduced.items():
                 writer.add_scalar(f'Loss/{k}', v.item(), global_step)
+            for k, v in sparse_debug_reduced.items():
+                writer.add_scalar(f'Sparse/{k}', v.item(), global_step)
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
