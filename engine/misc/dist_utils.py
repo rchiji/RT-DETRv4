@@ -127,6 +127,22 @@ def is_main_process():
 
 def save_on_master(*args, **kwargs):
     if is_main_process():
+        target = None
+        if len(args) >= 2:
+            target = args[1]
+        elif "f" in kwargs:
+            target = kwargs["f"]
+        elif "file" in kwargs:
+            target = kwargs["file"]
+
+        if isinstance(target, (str, bytes, os.PathLike)):
+            try:
+                path = os.fspath(target)
+                parent = os.path.dirname(path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+            except Exception:
+                pass
         torch.save(*args, **kwargs)
 
 
