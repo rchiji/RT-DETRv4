@@ -3,10 +3,11 @@ Copied from RT-DETR (https://github.com/lyuwenyu/RT-DETR)
 Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
 
-import os
 import copy
+import os
+from typing import Any, Dict, List, Optional
+
 import yaml
-from typing import Any, Dict, Optional, List
 
 from .workspace import GLOBAL_CONFIG
 
@@ -33,7 +34,7 @@ def load_config(file_path, cfg=dict()):
             return {}
 
     if INCLUDE_KEY in file_cfg:
-        base_yamls = list(file_cfg[INCLUDE_KEY])
+        base_yamls = list(file_cfg[INCLUDE_KEY])  # Ex) ['../dfine/dfine_hgnetv2_s_coco.yml', '../base/rtv4.yml']
         for base_yaml in base_yamls:
             if base_yaml.startswith('~'):
                 base_yaml = os.path.expanduser(base_yaml)
@@ -89,7 +90,6 @@ def parse_cli(nargs: List[str]) -> Dict:
         cfg = merge_dict(cfg, d)
 
     return cfg
-
 
 
 def merge_config(cfg, another_cfg=GLOBAL_CONFIG, inplace: bool=False, overwrite: bool=False):

@@ -11,31 +11,31 @@ reference
 Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
 
+import atexit
 import os
-import time
 import random
-from pathlib import Path
+import time
 from datetime import timedelta
+from pathlib import Path
 
 import numpy as np
-import atexit
-
 import torch
-import torch.nn as nn
-import torch.distributed
 import torch.backends.cudnn
-
+import torch.distributed
+import torch.nn as nn
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.nn.parallel import DataParallel as DP
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-
 from torch.utils.data import DistributedSampler
+
 # from torch.utils.data.dataloader import DataLoader
 from ..data import DataLoader
 
 
 def setup_distributed(print_rank: int=0, print_method: str='builtin', seed: int=None, ):
     """
+    PyTorchを用いた分散学習（Distributed Training）の環境を初期化するためのセットアップ関数
+
     env setup
     args:
         print_rank,
@@ -44,14 +44,22 @@ def setup_distributed(print_rank: int=0, print_method: str='builtin', seed: int=
     """
     try:
         # https://pytorch.org/docs/stable/elastic/run.html
+        # 1. 環境変数の取得
+        # RANK: 全体の中でのID（例：全8枚中、何番目か）
         RANK = int(os.getenv('RANK', -1))
+        # LOCAL_RANK: そのサーバー内でのGPUのID（例：1台のサーバーに4枚GPUがある場合、0-3のどれか）
         LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))
+        # 全体のGPU（プロセス）数
         WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
 
+        # 2. 通信グループの初期化
         # torch.distributed.init_process_group(backend=backend, init_method='env://')
+        # 分散学習の核となる設定。env:// は環境変数（IPアドレスやポート）を使って他のプロセスと通信を開始することを意味
         torch.distributed.init_process_group(init_method='env://', timeout=timedelta(seconds=72000))
+        # 「全員揃うまで待機」という合図。全プロセスが初期化を終えるまでここで同期
         torch.distributed.barrier()
 
+        # 3. GPUデバイスの割り当て
         rank = torch.distributed.get_rank()
         torch.cuda.set_device(rank)
         torch.cuda.empty_cache()
@@ -63,6 +71,8 @@ def setup_distributed(print_rank: int=0, print_method: str='builtin', seed: int=
         enabled_dist = False
         print('Not init distributed mode.')
 
+    # 4. ログ出力と乱数シードの設定
+    # （デフォルトは0）のプロセスだけがログを出力するように設定。これをしないと、GPUが8枚ある場合に同じログが8回表示されて画面が埋まってしまう。
     setup_print(get_rank() == print_rank, method=print_method)
     if seed is not None:
         setup_seed(seed)
@@ -182,7 +192,6 @@ def save_on_master(*args, **kwargs):
             raise last_exc
 
 
-
 def warp_model(
     model: torch.nn.Module,
     sync_bn: bool=False,
@@ -222,7 +231,6 @@ def warp_loader(loader, shuffle=False):
                             pin_memory=loader.pin_memory,
                             num_workers=loader.num_workers)
     return loader
-
 
 
 def is_parallel(model) -> bool:
@@ -285,7 +293,6 @@ def sync_time():
     return time.time()
 
 
-
 def setup_seed(seed: int, deterministic=False):
     """setup_seed for reproducibility
     torch.manual_seed(3407) is all you need. https://arxiv.org/abs/2109.08203
@@ -305,8 +312,10 @@ def setup_seed(seed: int, deterministic=False):
 
 # for torch.compile
 def check_compile():
-    import torch
     import warnings
+
+    import torch
+
     gpu_ok = False
     if torch.cuda.is_available():
         device_cap = torch.cuda.get_device_capability()
@@ -318,6 +327,7 @@ def check_compile():
             "than expected."
         )
     return gpu_ok
+
 
 def is_compile(model):
     import torch._dynamo
