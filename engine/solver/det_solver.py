@@ -17,6 +17,7 @@ from ..misc import dist_utils, stats
 
 from ._solver import BaseSolver
 from .det_engine import train_one_epoch, evaluate
+from .async_artifacts import AsyncArtifactDispatcher
 from ..optim.lr_scheduler import FlatCosineLRScheduler
 
 
@@ -30,6 +31,57 @@ def _metric_to_scalar(metric) -> float:
             return 0.0
         return float(metric.reshape(-1)[0].item())
     return float(metric)
+
+
+def _disable_writer(writer, reason: str) -> None:
+    """Best-effort disable for TensorBoard writer failures."""
+    if writer is None:
+        return
+    try:
+        setattr(writer, "_rtv4_disabled", True)
+    except Exception:
+        pass
+    # Keep the object alive but disabled; calling close() on a broken TB writer
+    # can trigger secondary worker-thread exceptions.
+    print(f"[warn] TensorBoard writer disabled in DetSolver: {reason}")
+
+
+def _append_json_line_with_retry(path, payload, retries: int = 30, wait_seconds: float = 0.2) -> None:
+    """Append one JSON line with retry; never raises to avoid aborting training on transient file locks."""
+    line = json.dumps(payload) + "\n"
+    last_exc: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(line)
+                f.flush()
+                # Best effort durability. On some platforms/filesystems this can still fail transiently.
+                try:
+                    import os
+                    os.fsync(f.fileno())
+                except OSError:
+                    pass
+            return
+        except (PermissionError, OSError) as exc:
+            last_exc = exc
+            if attempt < retries:
+                time.sleep(wait_seconds)
+                continue
+            break
+        except Exception as exc:
+            # Unexpected errors are also swallowed so training can continue.
+            last_exc = exc
+            break
+
+    # Final fallback: write into a sidecar file and continue training.
+    fallback = path.with_name(f"{path.stem}.fallback.log")
+    try:
+        with fallback.open("a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
+    print(f"[warn] failed to append {path}; continued without crashing. error={repr(last_exc)}")
 
 
 class DetSolver(BaseSolver):
@@ -84,169 +136,209 @@ class DetSolver(BaseSolver):
         best_stat_print = best_stat.copy()
         start_time = time.time()
         start_epoch = self.last_epoch + 1
-        for epoch in range(start_epoch, args.epoches):
 
-            self.train_dataloader.set_epoch(epoch)
-            # self.train_dataloader.dataset.set_epoch(epoch)
-            if dist_utils.is_dist_available_and_initialized():
-                self.train_dataloader.sampler.set_epoch(epoch)
-
-            if epoch == self.train_dataloader.collate_fn.stop_epoch:
-                self.load_resume_state(str(_checkpoint_target('best_stg1.pth')))
-                self.ema.decay = self.train_dataloader.collate_fn.ema_restart_decay
-                print(f'Refresh EMA at epoch {epoch} with decay {self.ema.decay}')
-
-            train_stats, grad_percentages = train_one_epoch(
-                self.self_lr_scheduler,
-                self.lr_scheduler,
-                self.model,
-                self.criterion,
-                self.train_dataloader,
-                self.optimizer,
-                self.device,
-                epoch,
-                max_norm=args.clip_max_norm,
-                print_freq=args.print_freq,
-                ema=self.ema,
-                scaler=self.scaler,
-                lr_warmup_scheduler=self.lr_warmup_scheduler,
-                writer=self.writer,
-                teacher_model=self.teacher_model, # NEW: Pass teacher model to train_one_epoch
+        async_dispatcher = None
+        if self.output_dir and dist_utils.is_main_process():
+            async_cfg = {}
+            if isinstance(getattr(self.cfg, "yaml_cfg", None), dict):
+                async_cfg = self.cfg.yaml_cfg.get("async_artifacts", {}) or {}
+            async_dispatcher = AsyncArtifactDispatcher.from_mapping(
+                async_cfg,
+                output_dir=self.output_dir,
             )
+            async_dispatcher.start()
 
-            if not self.self_lr_scheduler:  # update by epoch 
-                if self.lr_warmup_scheduler is None or self.lr_warmup_scheduler.finished():
-                    self.lr_scheduler.step()
+        try:
+            for epoch in range(start_epoch, args.epoches):
 
-            self.last_epoch += 1
-            if dist_utils.is_main_process() and hasattr(self.criterion, 'distill_adaptive_params') and \
-                self.criterion.distill_adaptive_params and self.criterion.distill_adaptive_params.get('enabled', False):
+                self.train_dataloader.set_epoch(epoch)
+                # self.train_dataloader.dataset.set_epoch(epoch)
+                if dist_utils.is_dist_available_and_initialized():
+                    self.train_dataloader.sampler.set_epoch(epoch)
 
-                params = self.criterion.distill_adaptive_params
-                default_weight = params.get('default_weight')
-
-                avg_percentage = sum(grad_percentages) / len(grad_percentages) if grad_percentages else 0.0
-
-                current_weight = self.criterion.weight_dict.get('loss_distill', 0.0)
-                new_weight = current_weight
-                reason = 'unchanged'
-
-                if avg_percentage < 1e-6:
-                    if default_weight is not None:
-                        new_weight = default_weight
-                        reason = 'reset_to_default_zero_grad'
-                elif epoch >= self.train_dataloader.collate_fn.stop_epoch:
-                    if default_weight is not None:
-                        new_weight = default_weight
-                        reason = 'ema_phase_default'
-                else:
-                    rho = params['rho']
-                    delta = params['delta']
-                    lower_bound = rho - delta
-                    upper_bound = rho + delta
-                    if not (lower_bound <= avg_percentage <= upper_bound):
-                        target_percentage = upper_bound if avg_percentage < lower_bound else lower_bound
-                        if current_weight > 1e-6:
-                            p_current = avg_percentage / 100.0
-                            p_target = target_percentage / 100.0
-                            numerator = p_target * (1.0 - p_current)
-                            denominator = p_current * (1.0 - p_target)
-                            if abs(denominator) >= 1e-9:
-                                ratio = numerator / denominator
-                                ratio = max(ratio, 0.1)  # clamp non-positive to 0.1
-                                new_weight = current_weight * ratio
-                                new_weight = min(max(new_weight, current_weight / 10.0), current_weight * 10.0)
-                                reason = f'adjusted_to_{target_percentage:.2f}%'
-
-                if abs(new_weight - current_weight) > 0:
-                    self.criterion.weight_dict['loss_distill'] = new_weight
-                print(f"Epoch {epoch}: avg encoder grad {avg_percentage:.2f}% | distill {current_weight:.6f} -> {new_weight:.6f} ({reason})")
-
-            if self.output_dir and epoch < self.train_dataloader.collate_fn.stop_epoch:
-                checkpoint_paths = [_checkpoint_target('last.pth')]
-                # extra checkpoint before LR drop and every 100 epochs
-                if (epoch + 1) % args.checkpoint_freq == 0:
-                    checkpoint_paths.append(_checkpoint_target(f'checkpoint{epoch:04}.pth'))
-                for checkpoint_path in checkpoint_paths:
-                    dist_utils.save_on_master(self.state_dict(), checkpoint_path)
-
-            module = self.ema.module if self.ema else self.model
-            test_stats, coco_evaluator = evaluate(
-                module,
-                self.criterion,
-                self.postprocessor,
-                self.val_dataloader,
-                self.evaluator,
-                self.device
-            )
-
-            # TODO
-            for k in test_stats:
-                metric_value = test_stats[k]
-                metric_scalar = _metric_to_scalar(metric_value)
-                if self.writer and dist_utils.is_main_process():
-                    if isinstance(metric_value, (list, tuple)):
-                        for i, v in enumerate(metric_value):
-                            self.writer.add_scalar(f'Test/{k}_{i}'.format(k), v, epoch)
-                    else:
-                        self.writer.add_scalar(f'Test/{k}'.format(k), metric_scalar, epoch)
-
-                if k in best_stat:
-                    best_stat['epoch'] = epoch if metric_scalar > best_stat[k] else best_stat['epoch']
-                    best_stat[k] = max(best_stat[k], metric_scalar)
-                else:
-                    best_stat['epoch'] = epoch
-                    best_stat[k] = metric_scalar
-
-                if best_stat[k] > top1:
-                    best_stat_print['epoch'] = epoch
-                    top1 = best_stat[k]
-                    if self.output_dir:
-                        if epoch >= self.train_dataloader.collate_fn.stop_epoch:
-                            dist_utils.save_on_master(self.state_dict(), _checkpoint_target('best_stg2.pth'))
-                        else:
-                            dist_utils.save_on_master(self.state_dict(), _checkpoint_target('best_stg1.pth'))
-
-                best_stat_print[k] = max(best_stat[k], top1)
-                print(f'best_stat: {best_stat_print}')  # global best
-
-                if best_stat['epoch'] == epoch and self.output_dir:
-                    if epoch >= self.train_dataloader.collate_fn.stop_epoch:
-                        if metric_scalar > top1:
-                            top1 = metric_scalar
-                            dist_utils.save_on_master(self.state_dict(), _checkpoint_target('best_stg2.pth'))
-                    else:
-                        top1 = max(metric_scalar, top1)
-                        dist_utils.save_on_master(self.state_dict(), _checkpoint_target('best_stg1.pth'))
-
-                elif epoch >= self.train_dataloader.collate_fn.stop_epoch:
-                    best_stat = {'epoch': -1, }
-                    self.ema.decay -= 0.0001
+                if epoch == self.train_dataloader.collate_fn.stop_epoch:
                     self.load_resume_state(str(_checkpoint_target('best_stg1.pth')))
+                    self.ema.decay = self.train_dataloader.collate_fn.ema_restart_decay
                     print(f'Refresh EMA at epoch {epoch} with decay {self.ema.decay}')
 
+                train_stats, grad_percentages = train_one_epoch(
+                    self.self_lr_scheduler,
+                    self.lr_scheduler,
+                    self.model,
+                    self.criterion,
+                    self.train_dataloader,
+                    self.optimizer,
+                    self.device,
+                    epoch,
+                    max_norm=args.clip_max_norm,
+                    print_freq=args.print_freq,
+                    ema=self.ema,
+                    scaler=self.scaler,
+                    lr_warmup_scheduler=self.lr_warmup_scheduler,
+                    writer=self.writer,
+                    teacher_model=self.teacher_model, # NEW: Pass teacher model to train_one_epoch
+                )
 
-            log_stats = {
-                **{f'train_{k}': v for k, v in train_stats.items()},
-                **{f'test_{k}': v for k, v in test_stats.items()},
-                'epoch': epoch,
-                'n_parameters': n_parameters
-            }
+                if not self.self_lr_scheduler:  # update by epoch 
+                    if self.lr_warmup_scheduler is None or self.lr_warmup_scheduler.finished():
+                        self.lr_scheduler.step()
 
-            if self.output_dir and dist_utils.is_main_process():
-                with (self.output_dir / "log.txt").open("a") as f:
-                    f.write(json.dumps(log_stats) + "\n")
+                self.last_epoch += 1
+                if dist_utils.is_main_process() and hasattr(self.criterion, 'distill_adaptive_params') and \
+                    self.criterion.distill_adaptive_params and self.criterion.distill_adaptive_params.get('enabled', False):
 
-                # for evaluation logs
-                if coco_evaluator is not None:
-                    (self.output_dir / 'eval').mkdir(exist_ok=True)
-                    if "bbox" in coco_evaluator.coco_eval:
-                        filenames = ['latest.pth']
-                        if epoch % 50 == 0:
-                            filenames.append(f'{epoch:03}.pth')
-                        for name in filenames:
-                            torch.save(coco_evaluator.coco_eval["bbox"].eval,
-                                    self.output_dir / "eval" / name)
+                    params = self.criterion.distill_adaptive_params
+                    default_weight = params.get('default_weight')
+
+                    avg_percentage = sum(grad_percentages) / len(grad_percentages) if grad_percentages else 0.0
+
+                    current_weight = self.criterion.weight_dict.get('loss_distill', 0.0)
+                    new_weight = current_weight
+                    reason = 'unchanged'
+
+                    if avg_percentage < 1e-6:
+                        if default_weight is not None:
+                            new_weight = default_weight
+                            reason = 'reset_to_default_zero_grad'
+                    elif epoch >= self.train_dataloader.collate_fn.stop_epoch:
+                        if default_weight is not None:
+                            new_weight = default_weight
+                            reason = 'ema_phase_default'
+                    else:
+                        rho = params['rho']
+                        delta = params['delta']
+                        lower_bound = rho - delta
+                        upper_bound = rho + delta
+                        if not (lower_bound <= avg_percentage <= upper_bound):
+                            target_percentage = upper_bound if avg_percentage < lower_bound else lower_bound
+                            if current_weight > 1e-6:
+                                p_current = avg_percentage / 100.0
+                                p_target = target_percentage / 100.0
+                                numerator = p_target * (1.0 - p_current)
+                                denominator = p_current * (1.0 - p_target)
+                                if abs(denominator) >= 1e-9:
+                                    ratio = numerator / denominator
+                                    ratio = max(ratio, 0.1)  # clamp non-positive to 0.1
+                                    new_weight = current_weight * ratio
+                                    new_weight = min(max(new_weight, current_weight / 10.0), current_weight * 10.0)
+                                    reason = f'adjusted_to_{target_percentage:.2f}%'
+
+                    if abs(new_weight - current_weight) > 0:
+                        self.criterion.weight_dict['loss_distill'] = new_weight
+                    print(f"Epoch {epoch}: avg encoder grad {avg_percentage:.2f}% | distill {current_weight:.6f} -> {new_weight:.6f} ({reason})")
+
+                overlay_checkpoint_path = None
+                if self.output_dir:
+                    checkpoint_paths = [_checkpoint_target('last.pth')]
+                    # extra checkpoint before LR drop and every 100 epochs
+                    if (epoch + 1) % args.checkpoint_freq == 0:
+                        checkpoint_paths.append(_checkpoint_target(f'checkpoint{epoch:04}.pth'))
+
+                    if async_dispatcher is not None and async_dispatcher.requires_epoch_checkpoint(epoch):
+                        overlay_checkpoint_path = _checkpoint_target(f'checkpoint{epoch:04}.pth')
+                        if overlay_checkpoint_path not in checkpoint_paths:
+                            checkpoint_paths.append(overlay_checkpoint_path)
+
+                    for checkpoint_path in checkpoint_paths:
+                        dist_utils.save_on_master(self.state_dict(), checkpoint_path)
+
+                    if overlay_checkpoint_path is None:
+                        if (epoch + 1) % args.checkpoint_freq == 0:
+                            overlay_checkpoint_path = _checkpoint_target(f'checkpoint{epoch:04}.pth')
+                        else:
+                            overlay_checkpoint_path = _checkpoint_target('last.pth')
+
+                module = self.ema.module if self.ema else self.model
+                test_stats, coco_evaluator = evaluate(
+                    module,
+                    self.criterion,
+                    self.postprocessor,
+                    self.val_dataloader,
+                    self.evaluator,
+                    self.device
+                )
+
+                # TODO
+                for k in test_stats:
+                    metric_value = test_stats[k]
+                    metric_scalar = _metric_to_scalar(metric_value)
+                    if self.writer and dist_utils.is_main_process() and not getattr(self.writer, "_rtv4_disabled", False):
+                        try:
+                            if isinstance(metric_value, (list, tuple)):
+                                for i, v in enumerate(metric_value):
+                                    self.writer.add_scalar(f'Test/{k}_{i}'.format(k), v, epoch)
+                            else:
+                                self.writer.add_scalar(f'Test/{k}'.format(k), metric_scalar, epoch)
+                        except Exception as exc:
+                            _disable_writer(self.writer, repr(exc))
+                            self.writer = None
+
+                    if k in best_stat:
+                        best_stat['epoch'] = epoch if metric_scalar > best_stat[k] else best_stat['epoch']
+                        best_stat[k] = max(best_stat[k], metric_scalar)
+                    else:
+                        best_stat['epoch'] = epoch
+                        best_stat[k] = metric_scalar
+
+                    if best_stat[k] > top1:
+                        best_stat_print['epoch'] = epoch
+                        top1 = best_stat[k]
+                        if self.output_dir:
+                            if epoch >= self.train_dataloader.collate_fn.stop_epoch:
+                                dist_utils.save_on_master(self.state_dict(), _checkpoint_target('best_stg2.pth'))
+                            else:
+                                dist_utils.save_on_master(self.state_dict(), _checkpoint_target('best_stg1.pth'))
+
+                    best_stat_print[k] = max(best_stat[k], top1)
+                    print(f'best_stat: {best_stat_print}')  # global best
+
+                    if best_stat['epoch'] == epoch and self.output_dir:
+                        if epoch >= self.train_dataloader.collate_fn.stop_epoch:
+                            if metric_scalar > top1:
+                                top1 = metric_scalar
+                                dist_utils.save_on_master(self.state_dict(), _checkpoint_target('best_stg2.pth'))
+                        else:
+                            top1 = max(metric_scalar, top1)
+                            dist_utils.save_on_master(self.state_dict(), _checkpoint_target('best_stg1.pth'))
+
+                    elif epoch >= self.train_dataloader.collate_fn.stop_epoch:
+                        best_stat = {'epoch': -1, }
+                        self.ema.decay -= 0.0001
+                        self.load_resume_state(str(_checkpoint_target('best_stg1.pth')))
+                        print(f'Refresh EMA at epoch {epoch} with decay {self.ema.decay}')
+
+
+                log_stats = {
+                    **{f'train_{k}': v for k, v in train_stats.items()},
+                    **{f'test_{k}': v for k, v in test_stats.items()},
+                    'epoch': epoch,
+                    'n_parameters': n_parameters
+                }
+
+                if self.output_dir and dist_utils.is_main_process():
+                    _append_json_line_with_retry(self.output_dir / "log.txt", log_stats)
+
+                    # for evaluation logs
+                    if coco_evaluator is not None:
+                        (self.output_dir / 'eval').mkdir(exist_ok=True)
+                        if "bbox" in coco_evaluator.coco_eval:
+                            filenames = ['latest.pth']
+                            if epoch % 50 == 0:
+                                filenames.append(f'{epoch:03}.pth')
+                            for name in filenames:
+                                dist_utils.save_on_master(
+                                    coco_evaluator.coco_eval["bbox"].eval,
+                                    self.output_dir / "eval" / name
+                                )
+
+                    if async_dispatcher is not None:
+                        async_dispatcher.submit_epoch(
+                            epoch=epoch,
+                            checkpoint_path=overlay_checkpoint_path,
+                        )
+        finally:
+            if async_dispatcher is not None:
+                async_dispatcher.close()
 
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
