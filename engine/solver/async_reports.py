@@ -1,7 +1,7 @@
 """
-Async artifact worker for RT-DETRv4 training.
+Async output worker for RT-DETRv4 training.
 
-This module keeps expensive artifact updates (history plot export, overlay image
+This module keeps expensive output updates (history plot export, overlay image
 generation) off the main training loop by dispatching jobs to a multiprocessing
 worker through a queue.
 """
@@ -19,7 +19,7 @@ from typing import Any, Dict, Optional
 
 
 @dataclass
-class AsyncArtifactSettings:
+class AsyncReportSettings:
     enabled: bool = False
     queue_size: int = 1024
 
@@ -51,7 +51,7 @@ class AsyncArtifactSettings:
         cfg: Dict[str, Any] | None,
         *,
         output_dir: Optional[Path] = None,
-    ) -> "AsyncArtifactSettings":
+    ) -> "AsyncReportSettings":
         data = dict(cfg or {})
         out = cls()
 
@@ -71,12 +71,8 @@ class AsyncArtifactSettings:
 
         out.overlay_check = bool(data.get("overlay_check", out.overlay_check))
         out.overlay_every = max(1, int(data.get("overlay_every", out.overlay_every)))
-        out.overlay_max_train_images = max(
-            0, int(data.get("overlay_max_train_images", out.overlay_max_train_images))
-        )
-        out.overlay_max_val_images = max(
-            0, int(data.get("overlay_max_val_images", out.overlay_max_val_images))
-        )
+        out.overlay_max_train_images = max(0, int(data.get("overlay_max_train_images", out.overlay_max_train_images)))
+        out.overlay_max_val_images = max(0, int(data.get("overlay_max_val_images", out.overlay_max_val_images)))
         out.overlay_score_thr = float(data.get("overlay_score_thr", out.overlay_score_thr))
         out.overlay_top_k = max(0, int(data.get("overlay_top_k", out.overlay_top_k)))
         out.overlay_seed = int(data.get("overlay_seed", out.overlay_seed))
@@ -95,16 +91,16 @@ class AsyncArtifactSettings:
         return out
 
 
-def _resolve_repo_src(settings: AsyncArtifactSettings) -> Path:
+def _resolve_repo_src(settings: AsyncReportSettings) -> Path:
     if settings.repo_src:
         return Path(settings.repo_src).resolve()
-    # .../src/RT-DERTv4/engine/solver/async_artifacts.py -> .../src
+    # .../src/RT-DERTv4/engine/solver/async_reports.py -> .../src
     return Path(__file__).resolve().parents[4]
 
 
 def _run_one_epoch_overlay(
     *,
-    settings: AsyncArtifactSettings,
+    settings: AsyncReportSettings,
     output_dir: Path,
     epoch: int,
     checkpoint_path: Optional[Path],
@@ -124,9 +120,7 @@ def _run_one_epoch_overlay(
 
     run_sparse = not sparse_summary.exists()
     run_full = bool(
-        settings.overlay_ref_train_annotations
-        and settings.overlay_ref_val_annotations
-        and (not full_summary.exists())
+        settings.overlay_ref_train_annotations and settings.overlay_ref_val_annotations and (not full_summary.exists())
     )
     if not run_sparse and not run_full:
         return
@@ -136,7 +130,7 @@ def _run_one_epoch_overlay(
         resolved_ckpt = find_checkpoint_for_epoch(output_dir=output_dir, epoch=int(epoch))
     if resolved_ckpt is None:
         print(
-            f"[async-artifacts] overlay skipped: checkpoint missing (epoch={epoch})",
+            f"[async-output] overlay skipped: checkpoint missing (epoch={epoch})",
             flush=True,
         )
         return
@@ -173,7 +167,7 @@ def _run_one_epoch_overlay(
             },
         )
         print(
-            f"[async-artifacts] epoch overlay saved: epoch={epoch} -> {summary_path}",
+            f"[async-output] epoch overlay saved: epoch={epoch} -> {summary_path}",
             flush=True,
         )
 
@@ -191,13 +185,13 @@ def _run_one_epoch_overlay(
             },
         )
         print(
-            f"[async-artifacts] epoch full-gt overlay saved: epoch={epoch} -> {summary_path}",
+            f"[async-output] epoch full-gt overlay saved: epoch={epoch} -> {summary_path}",
             flush=True,
         )
 
 
 def _worker_entry(job_queue: mp.Queue, raw_settings: Dict[str, Any]) -> None:
-    settings = AsyncArtifactSettings.from_mapping(raw_settings)
+    settings = AsyncReportSettings.from_mapping(raw_settings)
     if not settings.enabled:
         return
 
@@ -226,22 +220,21 @@ def _worker_entry(job_queue: mp.Queue, raw_settings: Dict[str, Any]) -> None:
         checkpoint_path = Path(str(checkpoint_text)).resolve() if checkpoint_text else None
 
         try:
-            next_count, artifacts = update_official_history_from_log(
+            next_count, history_outputs = update_official_history_from_log(
                 stdout_log_path=stdout_log,
                 output_dir=output_dir,
                 previous_count=last_count,
             )
             last_count = int(next_count)
-            if artifacts is not None:
-                json_path, csv_path, png_path, html_path = artifacts
+            if history_outputs is not None:
+                json_path, csv_path, png_path, html_path = history_outputs
                 print(
-                    "[async-artifacts] history updated: "
-                    f"{json_path} | {csv_path} | {png_path} | {html_path}",
+                    "[async-output] history updated: " f"{json_path} | {csv_path} | {png_path} | {html_path}",
                     flush=True,
                 )
         except Exception as exc:  # pragma: no cover - safety for long runs
             print(
-                f"[async-artifacts] history update failed at epoch={epoch}: {repr(exc)}",
+                f"[async-output] history update failed at epoch={epoch}: {repr(exc)}",
                 flush=True,
             )
             traceback.print_exc()
@@ -255,7 +248,7 @@ def _worker_entry(job_queue: mp.Queue, raw_settings: Dict[str, Any]) -> None:
             )
         except Exception as exc:  # pragma: no cover - safety for long runs
             print(
-                f"[async-artifacts] overlay failed at epoch={epoch}: {repr(exc)}",
+                f"[async-output] overlay failed at epoch={epoch}: {repr(exc)}",
                 flush=True,
             )
             traceback.print_exc()
@@ -271,10 +264,10 @@ def _worker_entry(job_queue: mp.Queue, raw_settings: Dict[str, Any]) -> None:
         pass
 
 
-class AsyncArtifactDispatcher:
-    """Main-process wrapper for async artifact worker."""
+class AsyncReportDispatcher:
+    """Main-process wrapper for async output worker."""
 
-    def __init__(self, settings: AsyncArtifactSettings) -> None:
+    def __init__(self, settings: AsyncReportSettings) -> None:
         self.settings = settings
         self._ctx = mp.get_context("spawn")
         self._queue: Optional[mp.Queue] = None
@@ -287,8 +280,8 @@ class AsyncArtifactDispatcher:
         cfg: Dict[str, Any] | None,
         *,
         output_dir: Optional[Path] = None,
-    ) -> "AsyncArtifactDispatcher":
-        settings = AsyncArtifactSettings.from_mapping(cfg, output_dir=output_dir)
+    ) -> "AsyncReportDispatcher":
+        settings = AsyncReportSettings.from_mapping(cfg, output_dir=output_dir)
         return cls(settings)
 
     def start(self) -> None:
@@ -299,12 +292,12 @@ class AsyncArtifactDispatcher:
             target=_worker_entry,
             args=(self._queue, asdict(self.settings)),
             daemon=True,
-            name="rtv4_async_artifacts",
+            name="rtv4_async_reports",
         )
         self._proc.start()
         self._started = True
         print(
-            f"[async-artifacts] worker started (pid={self._proc.pid}, queue={self.settings.queue_size})",
+            f"[async-output] worker started (pid={self._proc.pid}, queue={self.settings.queue_size})",
             flush=True,
         )
 
@@ -323,19 +316,17 @@ class AsyncArtifactDispatcher:
         payload = {
             "kind": "epoch_done",
             "epoch": int(epoch),
-            "checkpoint_path": (
-                str(checkpoint_path.resolve()) if checkpoint_path is not None else None
-            ),
+            "checkpoint_path": (str(checkpoint_path.resolve()) if checkpoint_path is not None else None),
         }
         try:
             self._queue.put_nowait(payload)
         except queue.Full:
             print(
-                f"[async-artifacts] queue full, dropped epoch job: epoch={epoch}",
+                f"[async-output] queue full, dropped epoch job: epoch={epoch}",
                 flush=True,
             )
         except Exception as exc:
-            print(f"[async-artifacts] enqueue failed: {repr(exc)}", flush=True)
+            print(f"[async-output] enqueue failed: {repr(exc)}", flush=True)
 
     def close(self, timeout_seconds: float = 300.0) -> None:
         if not self._started:
@@ -351,7 +342,7 @@ class AsyncArtifactDispatcher:
             if self._proc.is_alive():
                 self._proc.terminate()
                 self._proc.join(timeout=10.0)
-            print("[async-artifacts] worker stopped", flush=True)
+            print("[async-output] worker stopped", flush=True)
 
         self._started = False
         self._proc = None
@@ -361,3 +352,8 @@ class AsyncArtifactDispatcher:
             except Exception:
                 pass
         self._queue = None
+
+
+# Backward-compatible aliases
+AsyncReportSettings = AsyncReportSettings
+AsyncReportDispatcher = AsyncReportDispatcher
