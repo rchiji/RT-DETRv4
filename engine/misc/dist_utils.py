@@ -14,6 +14,7 @@ Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 import os
 import time
 import random
+from pathlib import Path
 from datetime import timedelta
 
 import numpy as np
@@ -135,15 +136,50 @@ def save_on_master(*args, **kwargs):
         elif "file" in kwargs:
             target = kwargs["file"]
 
-        if isinstance(target, (str, bytes, os.PathLike)):
+        if not isinstance(target, (str, bytes, os.PathLike)):
+            torch.save(*args, **kwargs)
+            return
+
+        # Robust checkpoint writer for Windows:
+        # - write to temp file first
+        # - atomic replace to target
+        # - retry on transient file-lock/permission errors
+        obj = args[0] if len(args) >= 1 else kwargs.get("obj", None)
+        extra_positional = list(args[2:]) if len(args) > 2 else []
+        save_kwargs = dict(kwargs)
+        save_kwargs.pop("f", None)
+        save_kwargs.pop("file", None)
+        save_kwargs.pop("obj", None)
+
+        path = Path(os.fspath(target))
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        retries = 20
+        retry_wait_seconds = 0.5
+        last_exc: Exception | None = None
+        for attempt in range(1, retries + 1):
+            tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}.{attempt}")
             try:
-                path = os.fspath(target)
-                parent = os.path.dirname(path)
-                if parent:
-                    os.makedirs(parent, exist_ok=True)
-            except Exception:
-                pass
-        torch.save(*args, **kwargs)
+                with open(tmp_path, "wb") as f:
+                    torch.save(obj, f, *extra_positional, **save_kwargs)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, path)
+                return
+            except Exception as exc:
+                last_exc = exc
+                try:
+                    if tmp_path.exists():
+                        tmp_path.unlink()
+                except Exception:
+                    pass
+                retryable = isinstance(exc, (PermissionError, OSError, RuntimeError))
+                if (not retryable) or attempt >= retries:
+                    raise
+                time.sleep(retry_wait_seconds)
+
+        if last_exc is not None:
+            raise last_exc
 
 
 

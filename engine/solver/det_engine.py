@@ -19,6 +19,21 @@ from ..optim import ModelEMA, Warmup
 from ..data import CocoEvaluator
 from ..misc import MetricLogger, SmoothedValue, dist_utils
 
+
+def _disable_writer(writer: SummaryWriter | None, reason: str) -> None:
+    """Best-effort disable for TensorBoard writer failures (e.g., transient file locks on Windows)."""
+    if writer is None:
+        return
+    try:
+        setattr(writer, "_rtv4_disabled", True)
+    except Exception:
+        pass
+    # Do not call writer.close() here:
+    # TensorBoard background worker can already be in a failed state and close() may
+    # surface another exception chain. Marking disabled is enough to stop future writes.
+    print(f"[warn] TensorBoard writer disabled: {reason}")
+
+
 def _compute_encoder_transformer_grad_percentage(model: torch.nn.Module) -> float:
     """Compute percentage of gradients attributed to encoder transformer only.
     This avoids collecting/printing any other stats for speed.
@@ -79,6 +94,8 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
 
     print_freq = kwargs.get('print_freq', 10)
     writer :SummaryWriter = kwargs.get('writer', None)
+    if writer is not None and getattr(writer, "_rtv4_disabled", False):
+        writer = None
 
     ema :ModelEMA = kwargs.get('ema', None)
     scaler :GradScaler = kwargs.get('scaler', None)
@@ -182,13 +199,17 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
         if writer and dist_utils.is_main_process() and global_step % 10 == 0:
-            writer.add_scalar('Loss/total', loss_value.item(), global_step)
-            for j, pg in enumerate(optimizer.param_groups):
-                writer.add_scalar(f'Lr/pg_{j}', pg['lr'], global_step)
-            for k, v in loss_dict_reduced.items():
-                writer.add_scalar(f'Loss/{k}', v.item(), global_step)
-            for k, v in sparse_debug_reduced.items():
-                writer.add_scalar(f'Sparse/{k}', v.item(), global_step)
+            try:
+                writer.add_scalar('Loss/total', loss_value.item(), global_step)
+                for j, pg in enumerate(optimizer.param_groups):
+                    writer.add_scalar(f'Lr/pg_{j}', pg['lr'], global_step)
+                for k, v in loss_dict_reduced.items():
+                    writer.add_scalar(f'Loss/{k}', v.item(), global_step)
+                for k, v in sparse_debug_reduced.items():
+                    writer.add_scalar(f'Sparse/{k}', v.item(), global_step)
+            except Exception as exc:
+                _disable_writer(writer, repr(exc))
+                writer = None
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()

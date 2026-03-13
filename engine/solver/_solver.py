@@ -18,6 +18,18 @@ from ..misc import dist_utils
 from ..core import BaseConfig
 
 
+def _safe_writer_close(writer):
+    """Best-effort writer close for atexit; suppress TensorBoard worker failures."""
+    if writer is None:
+        return
+    if getattr(writer, "_rtv4_disabled", False):
+        return
+    try:
+        writer.close()
+    except Exception:
+        pass
+
+
 def to(m: nn.Module, device: str):
     if m is None:
         return None
@@ -77,16 +89,32 @@ class BaseSolver(object):
 
         self.output_dir = Path(cfg.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.writer = cfg.writer
+        try:
+            self.writer = cfg.writer
+        except Exception as exc:
+            self.writer = None
+            print(f"[warn] Failed to create TensorBoard writer, continue without it: {repr(exc)}")
 
         if self.writer:
-            atexit.register(self.writer.close)
+            atexit.register(_safe_writer_close, self.writer)
             if dist_utils.is_main_process():
-                self.writer.add_text('config', '{:s}'.format(cfg.__repr__()), 0)
+                try:
+                    self.writer.add_text('config', '{:s}'.format(cfg.__repr__()), 0)
+                except Exception as exc:
+                    try:
+                        setattr(self.writer, "_rtv4_disabled", True)
+                    except Exception:
+                        pass
+                    try:
+                        self.writer.close()
+                    except Exception:
+                        pass
+                    self.writer = None
+                    print(f"[warn] Failed to write TensorBoard config text, writer disabled: {repr(exc)}")
 
     def cleanup(self):
         if self.writer:
-            atexit.register(self.writer.close)
+            atexit.register(_safe_writer_close, self.writer)
 
     def train(self):
         self._setup()
