@@ -6,19 +6,18 @@ Modified from DEIM: DETR with Improved Matching for Fast Convergence
 Copyright (c) 2024 The DEIM Authors. All Rights Reserved.
 """
 
-import time
-import json
 import datetime
+import json
 import math
+import time
 
 import torch
 
 from ..misc import dist_utils, stats
-
-from ._solver import BaseSolver
-from .det_engine import train_one_epoch, evaluate
-from .async_artifacts import AsyncArtifactDispatcher
 from ..optim.lr_scheduler import FlatCosineLRScheduler
+from ._solver import BaseSolver
+from .async_reports import AsyncReportDispatcher
+from .det_engine import evaluate, train_one_epoch
 
 
 def _metric_to_scalar(metric) -> float:
@@ -137,16 +136,17 @@ class DetSolver(BaseSolver):
         start_time = time.time()
         start_epoch = self.last_epoch + 1
 
-        async_dispatcher = None
+        async_report_dispatcher = None
         if self.output_dir and dist_utils.is_main_process():
-            async_cfg = {}
+            async_report_cfg = {}
             if isinstance(getattr(self.cfg, "yaml_cfg", None), dict):
-                async_cfg = self.cfg.yaml_cfg.get("async_artifacts", {}) or {}
-            async_dispatcher = AsyncArtifactDispatcher.from_mapping(
-                async_cfg,
+                yaml_cfg = self.cfg.yaml_cfg
+                async_report_cfg = yaml_cfg.get("async_reports") or yaml_cfg.get("async_reports") or {}
+            async_report_dispatcher = AsyncReportDispatcher.from_mapping(
+                async_report_cfg,
                 output_dir=self.output_dir,
             )
-            async_dispatcher.start()
+            async_report_dispatcher.start()
 
         try:
             for epoch in range(start_epoch, args.epoches):
@@ -179,7 +179,7 @@ class DetSolver(BaseSolver):
                     teacher_model=self.teacher_model, # NEW: Pass teacher model to train_one_epoch
                 )
 
-                if not self.self_lr_scheduler:  # update by epoch 
+                if not self.self_lr_scheduler:  # update by epoch
                     if self.lr_warmup_scheduler is None or self.lr_warmup_scheduler.finished():
                         self.lr_scheduler.step()
 
@@ -234,7 +234,7 @@ class DetSolver(BaseSolver):
                     if (epoch + 1) % args.checkpoint_freq == 0:
                         checkpoint_paths.append(_checkpoint_target(f'checkpoint{epoch:04}.pth'))
 
-                    if async_dispatcher is not None and async_dispatcher.requires_epoch_checkpoint(epoch):
+                    if async_report_dispatcher is not None and async_report_dispatcher.requires_epoch_checkpoint(epoch):
                         overlay_checkpoint_path = _checkpoint_target(f'checkpoint{epoch:04}.pth')
                         if overlay_checkpoint_path not in checkpoint_paths:
                             checkpoint_paths.append(overlay_checkpoint_path)
@@ -307,7 +307,6 @@ class DetSolver(BaseSolver):
                         self.load_resume_state(str(_checkpoint_target('best_stg1.pth')))
                         print(f'Refresh EMA at epoch {epoch} with decay {self.ema.decay}')
 
-
                 log_stats = {
                     **{f'train_{k}': v for k, v in train_stats.items()},
                     **{f'test_{k}': v for k, v in test_stats.items()},
@@ -331,19 +330,18 @@ class DetSolver(BaseSolver):
                                     self.output_dir / "eval" / name
                                 )
 
-                    if async_dispatcher is not None:
-                        async_dispatcher.submit_epoch(
+                    if async_report_dispatcher is not None:
+                        async_report_dispatcher.submit_epoch(
                             epoch=epoch,
                             checkpoint_path=overlay_checkpoint_path,
                         )
         finally:
-            if async_dispatcher is not None:
-                async_dispatcher.close()
+            if async_report_dispatcher is not None:
+                async_report_dispatcher.close()
 
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
         print('Training time {}'.format(total_time_str))
-
 
     def val(self, ):
         self.eval()
@@ -356,7 +354,6 @@ class DetSolver(BaseSolver):
             dist_utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, self.output_dir / "eval.pth")
 
         return
-
 
     def state_dict(self):
         """State dict, train/eval"""
