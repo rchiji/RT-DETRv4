@@ -5,17 +5,16 @@ Mostly copy-paste from https://github.com/pytorch/vision/blob/13b35ff/references
 Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
 
-import torch
-import torch.utils.data
-
-import torchvision
-
-from PIL import Image
 import faster_coco_eval
 import faster_coco_eval.core.mask as coco_mask
-from ._dataset import DetDataset
-from .._misc import convert_to_tv_tensor
+import torch
+import torch.utils.data
+import torchvision
+from PIL import Image
+
 from ...core import register
+from .._misc import convert_to_tv_tensor
+from ._dataset import DetDataset
 
 torchvision.disable_beta_transforms_warning()
 faster_coco_eval.init_as_pycocotools()
@@ -125,13 +124,10 @@ class ConvertCocoPolysToMask(object):
         image_id = torch.tensor([image_id])
 
         anno = target["annotations"]
-        anno_ignore = [obj for obj in anno if obj.get('iscrowd', 0) == 1 or obj.get('ignore', 0) == 1]
+        anno_ignore = [obj for obj in anno if obj.get("ignore", 0) == 1]
 
-        anno = [
-            obj
-            for obj in anno
-            if (obj.get('iscrowd', 0) == 0 and obj.get('ignore', 0) == 0)
-        ]
+        # iscrowd=1の群衆ラベルは無視
+        anno: list[dict] = [obj for obj in anno if (obj.get("iscrowd", 0) == 0 and obj.get("ignore", 0) == 0)]
 
         boxes = [obj["bbox"] for obj in anno]
         # guard against no boxes via resizing
