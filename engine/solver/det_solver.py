@@ -9,14 +9,16 @@ Copyright (c) 2024 The DEIM Authors. All Rights Reserved.
 import datetime
 import json
 import math
+import random
 import time
 
+import numpy as np
 import torch
 
 from ..misc import dist_utils, stats
 from ..optim.lr_scheduler import FlatCosineLRScheduler
 from ._solver import BaseSolver
-from .async_reports import AsyncReportDispatcher
+from async_reports import AsyncReportDispatcher
 from .det_engine import evaluate, train_one_epoch
 
 
@@ -83,6 +85,52 @@ def _append_json_line_with_retry(path, payload, retries: int = 30, wait_seconds:
     print(f"[warn] failed to append {path}; continued without crashing. error={repr(last_exc)}")
 
 
+class _EarlyStopping:
+    """Inline early stopping tracker."""
+
+    def __init__(self, cfg_dict: dict):
+        self.enabled = bool(cfg_dict.get("enabled", False))
+        self.metric = str(cfg_dict.get("metric", "eval_bbox_ap"))
+        self.mode = str(cfg_dict.get("mode", "max"))
+        self.patience = int(cfg_dict.get("patience", 15))
+        self.min_delta = float(cfg_dict.get("min_delta", 0.001))
+        self.min_epochs = int(cfg_dict.get("min_epochs", 0))
+        self.best_value: float = float("-inf") if self.mode == "max" else float("inf")
+        self.best_epoch: int = -1
+        self.no_improve_count: int = 0
+
+    def step(self, epoch: int, metric_value: float) -> bool:
+        """Return True if training should stop."""
+        if not self.enabled:
+            return False
+        improved = False
+        if self.mode == "max":
+            improved = metric_value > self.best_value + self.min_delta
+        else:
+            improved = metric_value < self.best_value - self.min_delta
+        if improved:
+            self.best_value = metric_value
+            self.best_epoch = epoch
+            self.no_improve_count = 0
+        else:
+            self.no_improve_count += 1
+        if epoch < self.min_epochs:
+            return False
+        return self.no_improve_count >= self.patience
+
+    def to_dict(self) -> dict:
+        return {
+            "metric": self.metric,
+            "mode": self.mode,
+            "patience": self.patience,
+            "min_delta": self.min_delta,
+            "min_epochs": self.min_epochs,
+            "best_value": self.best_value,
+            "best_epoch": self.best_epoch,
+            "no_improve_count": self.no_improve_count,
+        }
+
+
 class DetSolver(BaseSolver):
 
     def fit(self, ):
@@ -111,6 +159,15 @@ class DetSolver(BaseSolver):
             self.self_lr_scheduler = True
         n_parameters = sum([p.numel() for p in self.model.parameters() if p.requires_grad])
         print(f'number of trainable parameters: {n_parameters}')
+
+        # Early stopping setup
+        early_stop_cfg = {}
+        if isinstance(getattr(args, "yaml_cfg", None), dict):
+            early_stop_cfg = args.yaml_cfg.get("early_stop", {}) or {}
+        early_stopper = _EarlyStopping(early_stop_cfg)
+        if early_stopper.enabled:
+            print(f"[early-stop] enabled: metric={early_stopper.metric}, mode={early_stopper.mode}, "
+                  f"patience={early_stopper.patience}, min_epochs={early_stopper.min_epochs}")
 
         top1 = 0
         best_stat = {'epoch': -1, }
@@ -155,6 +212,21 @@ class DetSolver(BaseSolver):
                 # self.train_dataloader.dataset.set_epoch(epoch)
                 if dist_utils.is_dist_available_and_initialized():
                     self.train_dataloader.sampler.set_epoch(epoch)
+
+                # Epoch-based seeding for reproducibility (non-distributed)
+                base_seed = int(args.seed) if args.seed is not None else 0
+                epoch_seed = base_seed + epoch
+                random.seed(epoch_seed)
+                np.random.seed(epoch_seed % (2**31))
+                torch.manual_seed(epoch_seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(epoch_seed)
+                # Re-seed the dataloader's RandomSampler for shuffle reproducibility
+                sampler = getattr(self.train_dataloader, 'sampler', None)
+                if sampler is not None and hasattr(sampler, 'generator'):
+                    if sampler.generator is None:
+                        sampler.generator = torch.Generator()
+                    sampler.generator.manual_seed(epoch_seed)
 
                 if epoch == self.train_dataloader.collate_fn.stop_epoch:
                     self.load_resume_state(str(_checkpoint_target('best_stg1.pth')))
@@ -228,25 +300,28 @@ class DetSolver(BaseSolver):
                     print(f"Epoch {epoch}: avg encoder grad {avg_percentage:.2f}% | distill {current_weight:.6f} -> {new_weight:.6f} ({reason})")
 
                 overlay_checkpoint_path = None
+                overlay_checkpoint_is_temporary = False
                 if self.output_dir:
                     checkpoint_paths = [_checkpoint_target('last.pth')]
-                    # extra checkpoint before LR drop and every 100 epochs
+                    # Save per-epoch checkpoint only when checkpoint_freq matches
                     if (epoch + 1) % args.checkpoint_freq == 0:
                         checkpoint_paths.append(_checkpoint_target(f'checkpoint{epoch:04}.pth'))
 
-                    if async_report_dispatcher is not None and async_report_dispatcher.requires_epoch_checkpoint(epoch):
+                    needs_overlay_ckpt = (
+                        async_report_dispatcher is not None
+                        and async_report_dispatcher.requires_epoch_checkpoint(epoch)
+                    )
+                    if needs_overlay_ckpt:
                         overlay_checkpoint_path = _checkpoint_target(f'checkpoint{epoch:04}.pth')
                         if overlay_checkpoint_path not in checkpoint_paths:
                             checkpoint_paths.append(overlay_checkpoint_path)
+                            overlay_checkpoint_is_temporary = True
 
                     for checkpoint_path in checkpoint_paths:
                         dist_utils.save_on_master(self.state_dict(), checkpoint_path)
 
                     if overlay_checkpoint_path is None:
-                        if (epoch + 1) % args.checkpoint_freq == 0:
-                            overlay_checkpoint_path = _checkpoint_target(f'checkpoint{epoch:04}.pth')
-                        else:
-                            overlay_checkpoint_path = _checkpoint_target('last.pth')
+                        overlay_checkpoint_path = _checkpoint_target('last.pth')
 
                 module = self.ema.module if self.ema else self.model
                 test_stats, coco_evaluator = evaluate(
@@ -334,7 +409,35 @@ class DetSolver(BaseSolver):
                         async_report_dispatcher.submit_epoch(
                             epoch=epoch,
                             checkpoint_path=overlay_checkpoint_path,
+                            cleanup_checkpoint=overlay_checkpoint_is_temporary,
                         )
+
+                # Early stopping check
+                if early_stopper.enabled and dist_utils.is_main_process():
+                    es_metric_key = f"test_{early_stopper.metric}"
+                    es_value = None
+                    if es_metric_key in log_stats:
+                        raw = log_stats[es_metric_key]
+                        es_value = _metric_to_scalar(raw) if not isinstance(raw, (int, float)) else float(raw)
+                    if es_value is not None:
+                        should_stop = early_stopper.step(epoch, es_value)
+                        print(f"[early-stop] epoch={epoch}, {early_stopper.metric}={es_value:.6f}, "
+                              f"best={early_stopper.best_value:.6f}@{early_stopper.best_epoch}, "
+                              f"no_improve={early_stopper.no_improve_count}/{early_stopper.patience}")
+                        if should_stop:
+                            es_info = {
+                                "triggered_at": datetime.datetime.now().isoformat(),
+                                "stopped_epoch": epoch,
+                                "stopped_metric_value": es_value,
+                                **early_stopper.to_dict(),
+                            }
+                            es_path = self.output_dir / "early_stop.json"
+                            with open(es_path, "w", encoding="utf-8") as f:
+                                json.dump(es_info, f, indent=2, ensure_ascii=False)
+                            print(f"[early-stop] TRIGGERED at epoch {epoch}. "
+                                  f"Best was {early_stopper.best_value:.6f} at epoch {early_stopper.best_epoch}. "
+                                  f"Saved: {es_path}")
+                            break
         finally:
             if async_report_dispatcher is not None:
                 async_report_dispatcher.close()
