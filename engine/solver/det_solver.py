@@ -419,6 +419,19 @@ class DetSolver(BaseSolver):
                     if es_metric_key in log_stats:
                         raw = log_stats[es_metric_key]
                         es_value = _metric_to_scalar(raw) if not isinstance(raw, (int, float)) else float(raw)
+                    # Fallback: extract AP from test_coco_eval_bbox list
+                    if es_value is None and "test_coco_eval_bbox" in log_stats:
+                        coco_stats = log_stats["test_coco_eval_bbox"]
+                        metric_name = early_stopper.metric.lower()
+                        _coco_index_map = {
+                            "eval_bbox_ap": 0, "ap": 0,
+                            "eval_bbox_ap50": 1, "ap50": 1,
+                            "eval_bbox_ap75": 2, "ap75": 2,
+                            "eval_bbox_ar_100": 8, "ar100": 8,
+                        }
+                        idx = _coco_index_map.get(metric_name, None)
+                        if idx is not None and isinstance(coco_stats, (list, tuple)) and len(coco_stats) > idx:
+                            es_value = float(coco_stats[idx])
                     if es_value is not None:
                         should_stop = early_stopper.step(epoch, es_value)
                         print(f"[early-stop] epoch={epoch}, {early_stopper.metric}={es_value:.6f}, "
