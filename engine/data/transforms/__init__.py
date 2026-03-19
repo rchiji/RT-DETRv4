@@ -14,6 +14,7 @@ from ._transforms import (
     PadToSize,
     SanitizeBoundingBoxes,
     RandomCrop,
+    RandomCropWithGT,
     Normalize,
     ConvertBoxes,
     ConvertPILImage,

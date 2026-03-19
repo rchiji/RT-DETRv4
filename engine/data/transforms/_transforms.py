@@ -113,6 +113,60 @@ class RandomIoUCrop(T.RandomIoUCrop):
 
 
 @register()
+class RandomCropWithGT(nn.Module):
+    def __init__(
+        self,
+        size,
+        pad_if_needed: bool = True,
+        fill=0,
+        padding_mode: str = 'constant',
+        trials: int = 10,
+        min_size: float = 1,
+        keep_non_empty: bool = True,
+    ) -> None:
+        super().__init__()
+        self.random_crop = T.RandomCrop(
+            size=size,
+            pad_if_needed=pad_if_needed,
+            fill=fill,
+            padding_mode=padding_mode,
+        )
+        self.sanitize = SanitizeBoundingBoxes(min_size=min_size)
+        self.trials = int(trials)
+        self.keep_non_empty = keep_non_empty
+
+    @staticmethod
+    def _extract_target(sample: Any) -> Optional[dict]:
+        if isinstance(sample, (tuple, list)) and len(sample) >= 2 and isinstance(sample[1], dict):
+            return sample[1]
+        if isinstance(sample, dict):
+            return sample
+        return None
+
+    def _has_boxes(self, sample: Any) -> bool:
+        target = self._extract_target(sample)
+        if target is None:
+            return False
+        boxes = target.get('boxes')
+        return boxes is not None and len(boxes) > 0
+
+    def forward(self, *inputs: Any) -> Any:
+        sample = inputs if len(inputs) > 1 else inputs[0]
+        if not self.keep_non_empty or not self._has_boxes(sample):
+            return self.random_crop(sample)
+
+        last_candidate = None
+        for _ in range(max(1, self.trials)):
+            candidate = self.random_crop(sample)
+            candidate = self.sanitize(candidate)
+            if self._has_boxes(candidate):
+                return candidate
+            last_candidate = candidate
+
+        return last_candidate if last_candidate is not None else self.random_crop(sample)
+
+
+@register()
 class ConvertBoxes(T.Transform):
     _transformed_types = (
         BoundingBoxes,
