@@ -47,3 +47,7 @@ RTv4Criterion:
   # loss_distill here is 5 times the reported setting due to zero aux loss
   losses: ['mal', 'boxes', 'local', 'distill']
   gamma: 1.5
+  sparse_label: False
+  sparse_ignore_iou_threshold: 0.5
+  sparse_ignore_negative_weight: 1.0
+  sparse_unmatched_negative_weight: 1.0
