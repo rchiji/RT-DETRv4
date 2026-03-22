@@ -39,7 +39,7 @@ class AsyncReportSettings:
     overlay_max_train_images: int = 0
     overlay_max_val_images: int = 0
     overlay_score_thr: float = 0.3
-    overlay_top_k: int = 100
+    overlay_top_k: int = 0
     overlay_seed: int = 0
     overlay_device: str = "cpu"
     overlay_ref_train_annotations: Optional[str] = None
