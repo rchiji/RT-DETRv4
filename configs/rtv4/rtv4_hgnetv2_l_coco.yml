@@ -7,7 +7,7 @@ output_dir: ./outputs/rtv4_hgnetv2_l_coco
 
 teacher_model:
   type: "DINOv3TeacherModel"
-  dinov3_repo_path: dinov3/
+  dinov3_repo_path: ../../../dinov3/
   dinov3_weights_path: pretrain/dinov3_vitb16_pretrain_lvd1689m.pth
   patch_size: 16
   mean: [0.485, 0.456, 0.406]
