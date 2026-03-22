@@ -3,23 +3,27 @@ Copied from RT-DETR (https://github.com/lyuwenyu/RT-DETR)
 Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
 
+from typing import Any, Dict, List, Optional
+
+import PIL
+import PIL.Image
 import torch
 import torch.nn as nn
-
 import torchvision
 import torchvision.transforms.v2 as T
 import torchvision.transforms.v2.functional as F
 
-import PIL
-import PIL.Image
-
-from typing import Any, Dict, List, Optional
-
-from .._misc import convert_to_tv_tensor, _boxes_keys
-from .._misc import Image, Video, Mask, BoundingBoxes
-from .._misc import SanitizeBoundingBoxes
-
 from ...core import register
+from .._misc import (
+    BoundingBoxes,
+    Image,
+    Mask,
+    SanitizeBoundingBoxes,
+    Video,
+    _boxes_keys,
+    convert_to_tv_tensor,
+)
+
 torchvision.disable_beta_transforms_warning()
 
 
@@ -68,7 +72,7 @@ class PadToSize(T.Pad):
 
     def transform(self, inpt: Any, params: Dict[str, Any]) -> Any:
         return self._transform(inpt, params)
-    
+
     def _transform(self, inpt: Any, params: Dict[str, Any]) -> Any:
         fill = self._fill[type(inpt)]
         padding = params['padding']
@@ -114,24 +118,29 @@ class RandomIoUCrop(T.RandomIoUCrop):
 
 @register()
 class RandomCropWithGT(nn.Module):
+    """
+    画像をランダムクロップする処理。少なくとも1つのGTボックスがクロップ内に残るように試行する。クロップ内にGTボックスが残らない場合は、最後の候補を返すか、ランダムクロップを返す。
+    """
+
     def __init__(
         self,
-        size,
+        size: int,  # 640
         pad_if_needed: bool = True,
-        fill=0,
-        padding_mode: str = 'constant',
-        trials: int = 10,
+        fill: int = 0,
+        padding_mode: str = "constant",
+        trials: int = 10,  # 試行回数
         min_size: float = 1,
         keep_non_empty: bool = True,
     ) -> None:
         super().__init__()
-        self.random_crop = T.RandomCrop(
+        self.random_crop: callable = T.RandomCrop(
             size=size,
             pad_if_needed=pad_if_needed,
             fill=fill,
             padding_mode=padding_mode,
         )
-        self.sanitize = SanitizeBoundingBoxes(min_size=min_size)
+        # torchvisionのSanitizeBoundingBoxesは、クロップ後のボックスがmin_size未満の場合に削除する。これにより、クロップ内にGTが残る確率が上がる。
+        self.sanitize: callable = SanitizeBoundingBoxes(min_size=min_size)
         self.trials = int(trials)
         self.keep_non_empty = keep_non_empty
 
@@ -144,13 +153,16 @@ class RandomCropWithGT(nn.Module):
         return None
 
     def _has_boxes(self, sample: Any) -> bool:
-        target = self._extract_target(sample)
+        target: dict | None = self._extract_target(sample)
         if target is None:
             return False
         boxes = target.get('boxes')
         return boxes is not None and len(boxes) > 0
 
     def forward(self, *inputs: Any) -> Any:
+        """
+        多分 sample = (img, {"boxes": boxes, "labels": labels})
+        """
         sample = inputs if len(inputs) > 1 else inputs[0]
         if not self.keep_non_empty or not self._has_boxes(sample):
             return self.random_crop(sample)
@@ -178,7 +190,7 @@ class ConvertBoxes(T.Transform):
 
     def transform(self, inpt: Any, params: Dict[str, Any]) -> Any:
         return self._transform(inpt, params)
-    
+
     def _transform(self, inpt: Any, params: Dict[str, Any]) -> Any:
         spatial_size = getattr(inpt, _boxes_keys[1])
         if self.fmt:
@@ -204,7 +216,7 @@ class ConvertPILImage(T.Transform):
 
     def transform(self, inpt: Any, params: Dict[str, Any]) -> Any:
         return self._transform(inpt, params)
-    
+
     def _transform(self, inpt: Any, params: Dict[str, Any]) -> Any:
         inpt = F.pil_to_tensor(inpt)
         if self.dtype == 'float32':
