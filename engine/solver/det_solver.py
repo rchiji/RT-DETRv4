@@ -18,7 +18,7 @@ import torch
 from ..misc import dist_utils, stats
 from ..optim.lr_scheduler import FlatCosineLRScheduler
 from ._solver import BaseSolver
-from async_reports import AsyncReportDispatcher
+from utils.async_reports import AsyncReportDispatcher
 from .det_engine import evaluate, train_one_epoch
 
 
