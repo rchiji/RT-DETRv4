@@ -34,6 +34,13 @@ def _metric_to_scalar(metric) -> float:
     return float(metric)
 
 
+def _metric_to_best_scalar(metric_name: str, metric) -> float | None:
+    """Return a comparable scalar only for checkpoint-selection metrics."""
+    if not str(metric_name).startswith("coco_eval_"):
+        return None
+    return _metric_to_scalar(metric)
+
+
 def _disable_writer(writer, reason: str) -> None:
     """Best-effort disable for TensorBoard writer failures."""
     if writer is None:
@@ -136,6 +143,9 @@ class DetSolver(BaseSolver):
     def fit(self, ):
         self.train()
         args = self.cfg
+        official_eval_cfg = {}
+        if isinstance(getattr(self.cfg, "yaml_cfg", None), dict):
+            official_eval_cfg = self.cfg.yaml_cfg.get("official_eval", {}) or {}
         checkpoint_dir = None
         if self.output_dir:
             checkpoint_dir = self.output_dir / "checkpoints"
@@ -180,10 +190,13 @@ class DetSolver(BaseSolver):
                 self.postprocessor,
                 self.val_dataloader,
                 self.evaluator,
-                self.device
+                self.device,
+                official_eval_cfg=official_eval_cfg,
             )
             for k in test_stats:
-                metric_scalar = _metric_to_scalar(test_stats[k])
+                metric_scalar = _metric_to_best_scalar(k, test_stats[k])
+                if metric_scalar is None:
+                    continue
                 best_stat['epoch'] = self.last_epoch
                 best_stat[k] = metric_scalar
                 top1 = metric_scalar
@@ -330,7 +343,8 @@ class DetSolver(BaseSolver):
                     self.postprocessor,
                     self.val_dataloader,
                     self.evaluator,
-                    self.device
+                    self.device,
+                    official_eval_cfg=official_eval_cfg,
                 )
 
                 # TODO
@@ -347,6 +361,10 @@ class DetSolver(BaseSolver):
                         except Exception as exc:
                             _disable_writer(self.writer, repr(exc))
                             self.writer = None
+
+                    metric_scalar = _metric_to_best_scalar(k, metric_value)
+                    if metric_scalar is None:
+                        continue
 
                     if k in best_stat:
                         best_stat['epoch'] = epoch if metric_scalar > best_stat[k] else best_stat['epoch']
@@ -461,10 +479,13 @@ class DetSolver(BaseSolver):
 
     def val(self, ):
         self.eval()
+        official_eval_cfg = {}
+        if isinstance(getattr(self.cfg, "yaml_cfg", None), dict):
+            official_eval_cfg = self.cfg.yaml_cfg.get("official_eval", {}) or {}
 
         module = self.ema.module if self.ema else self.model
         test_stats, coco_evaluator = evaluate(module, self.criterion, self.postprocessor,
-                self.val_dataloader, self.evaluator, self.device)
+                self.val_dataloader, self.evaluator, self.device, official_eval_cfg=official_eval_cfg)
 
         if self.output_dir:
             dist_utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, self.output_dir / "eval.pth")

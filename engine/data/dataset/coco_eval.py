@@ -18,6 +18,9 @@ from ...misc import dist_utils
 __all__ = ['CocoEvaluator',]
 
 
+UNLIMITED_COCO_MAX_DETS = [1, 10, 1_000_000]
+
+
 @register()
 class CocoEvaluator(object):
     def __init__(self, coco_gt, iou_types):
@@ -29,6 +32,7 @@ class CocoEvaluator(object):
         self.coco_eval = {}
         for iou_type in iou_types:
             self.coco_eval[iou_type] = COCOeval_faster(coco_gt, iouType=iou_type, print_function=print, separate_eval=True)
+            self.coco_eval[iou_type].params.maxDets = list(UNLIMITED_COCO_MAX_DETS)
 
         self.img_ids = []
         self.eval_imgs = {k: [] for k in iou_types}
@@ -37,6 +41,7 @@ class CocoEvaluator(object):
         self.coco_eval = {}
         for iou_type in self.iou_types:
             self.coco_eval[iou_type] = COCOeval_faster(self.coco_gt, iouType=iou_type, print_function=print, separate_eval=True)
+            self.coco_eval[iou_type].params.maxDets = list(UNLIMITED_COCO_MAX_DETS)
         self.img_ids = []
         self.eval_imgs = {k: [] for k in self.iou_types}
 
@@ -55,6 +60,7 @@ class CocoEvaluator(object):
                     coco_dt = self.coco_gt.loadRes(results) if results else COCO()
                     coco_eval.cocoDt = coco_dt
                     coco_eval.params.imgIds = list(img_ids)
+                    coco_eval.params.maxDets = list(UNLIMITED_COCO_MAX_DETS)
                     coco_eval.evaluate()
 
             self.eval_imgs[iou_type].append(np.array(coco_eval._evalImgs_cpp).reshape(len(coco_eval.params.catIds), len(coco_eval.params.areaRng), len(coco_eval.params.imgIds)))

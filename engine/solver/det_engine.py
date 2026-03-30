@@ -8,16 +8,19 @@ Copyright (c) 2024 The DEIM Authors. All Rights Reserved.
 
 import sys
 import math
+import time
 from typing import Iterable
 
 import torch
 import torch.amp
+import torchvision.transforms.v2 as T
 from torch.utils.tensorboard import SummaryWriter
 from torch.cuda.amp.grad_scaler import GradScaler
 
 from ..optim import ModelEMA, Warmup
 from ..data import CocoEvaluator
 from ..misc import MetricLogger, SmoothedValue, dist_utils
+from utils.viz.inference_viz import _run_official_tiled_detection
 
 
 def _disable_writer(writer: SummaryWriter | None, reason: str) -> None:
@@ -217,9 +220,18 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
 
 
 @torch.no_grad()
-def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, data_loader, coco_evaluator: CocoEvaluator, device):
+def evaluate(
+    model: torch.nn.Module,
+    criterion: torch.nn.Module,
+    postprocessor,
+    data_loader,
+    coco_evaluator: CocoEvaluator,
+    device,
+    official_eval_cfg: dict | None = None,
+):
     model.eval()
     coco_evaluator.cleanup()
+    eval_started_at = time.time()
 
     metric_logger = MetricLogger(delimiter="  ")
     # metric_logger.add_meter('class_error', SmoothedValue(window_size=1, fmt='{value:.2f}'))
@@ -229,6 +241,87 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, 
     iou_types = coco_evaluator.iou_types
     # coco_evaluator = CocoEvaluator(base_ds, iou_types)
     # coco_evaluator.coco_eval[iou_types[0]].params.iouThrs = [0, 0.1, 0.5, 0.75]
+
+    official_eval_cfg = official_eval_cfg or {}
+    use_grid_eval = bool(official_eval_cfg.get("use_grid", False))
+    tile_size = int(official_eval_cfg.get("tile_size", 640) or 640)
+    tile_overlap = int(official_eval_cfg.get("tile_overlap", max(32, tile_size // 4)) or 0)
+    tile_batch_size = int(official_eval_cfg.get("tile_batch_size", 4) or 4)
+    tile_nms_iou = float(official_eval_cfg.get("tile_nms_iou", 0.5) or 0.5)
+    tile_border_margin = int(official_eval_cfg.get("tile_border_margin", 5) or 0)
+    score_thr = float(official_eval_cfg.get("score_thr", 0.0) or 0.0)
+    top_k = int(official_eval_cfg.get("top_k", 0) or 0)
+    to_tensor = T.ToTensor()
+    dataset = getattr(data_loader, "dataset", None)
+    can_use_grid_eval = (
+        use_grid_eval
+        and dataset is not None
+        and hasattr(dataset, "load_item")
+    )
+    total_tiles = 0
+
+    if can_use_grid_eval:
+        world_size = int(dist_utils.get_world_size())
+        rank = int(dist_utils.get_rank())
+        sample_indices = range(rank, len(dataset), world_size)
+
+        for sample_idx in metric_logger.log_every(sample_indices, 10, header):
+            image, full_target = dataset.load_item(int(sample_idx))
+            image_id = int(full_target["image_id"].reshape(-1)[0].item())
+            image_width, image_height = image.size
+            boxes, scores, labels, det_stats = _run_official_tiled_detection(
+                model=model,
+                postprocessor=postprocessor,
+                image=image,
+                image_width=int(image_width),
+                image_height=int(image_height),
+                to_tensor=to_tensor,
+                device=device,
+                score_thr=float(score_thr),
+                top_k=int(top_k),
+                tile_size=int(tile_size),
+                tile_overlap=int(tile_overlap),
+                tile_batch_size=int(tile_batch_size),
+                tile_nms_iou=float(tile_nms_iou),
+                tile_border_margin=int(tile_border_margin),
+            )
+            total_tiles += int(det_stats.get("num_tiles", 0))
+            if coco_evaluator is not None:
+                coco_evaluator.update(
+                    {
+                        image_id: {
+                            "boxes": torch.from_numpy(boxes),
+                            "scores": torch.from_numpy(scores),
+                            "labels": torch.from_numpy(labels).to(torch.int64),
+                        }
+                    }
+                )
+
+        metric_logger.synchronize_between_processes()
+        if len(metric_logger.meters) > 0:
+            print("Averaged stats:", metric_logger)
+        else:
+            print("Averaged stats: (COCO metrics only)")
+        if coco_evaluator is not None:
+            coco_evaluator.synchronize_between_processes()
+
+        if coco_evaluator is not None:
+            coco_evaluator.accumulate()
+            coco_evaluator.summarize()
+
+        stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+        stats["eval_wall_time_seconds"] = float(time.time() - eval_started_at)
+        stats["eval_num_tiles"] = float(total_tiles)
+        print(
+            f"[official-eval] grid inference enabled: "
+            f"tile_size={tile_size}, overlap={tile_overlap}, total_tiles={total_tiles}"
+        )
+        if coco_evaluator is not None:
+            if 'bbox' in iou_types:
+                stats['coco_eval_bbox'] = coco_evaluator.coco_eval['bbox'].stats.tolist()
+            if 'segm' in iou_types:
+                stats['coco_eval_masks'] = coco_evaluator.coco_eval['segm'].stats.tolist()
+        return stats, coco_evaluator
 
     for i, (samples, targets) in enumerate(metric_logger.log_every(data_loader, 10, header)):
         samples = samples.to(device)
@@ -263,6 +356,13 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, 
         coco_evaluator.summarize()
 
     stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    stats["eval_wall_time_seconds"] = float(time.time() - eval_started_at)
+    if can_use_grid_eval:
+        stats["eval_num_tiles"] = float(total_tiles)
+        print(
+            f"[official-eval] grid inference enabled: "
+            f"tile_size={tile_size}, overlap={tile_overlap}, total_tiles={total_tiles}"
+        )
     if coco_evaluator is not None:
         if 'bbox' in iou_types:
             stats['coco_eval_bbox'] = coco_evaluator.coco_eval['bbox'].stats.tolist()
