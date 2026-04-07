@@ -336,6 +336,11 @@ class DetSolver(BaseSolver):
                     if overlay_checkpoint_path is None:
                         overlay_checkpoint_path = _checkpoint_target('last.pth')
 
+                # epoch間でCUDA caching allocatorの断片化メモリを解放する。
+                # GT数がバッチごとに変動する場合、異なるサイズのテンソルが
+                # denoising / matcher / criterion で生成され、未使用ブロックが蓄積する。
+                torch.cuda.empty_cache()
+
                 module = self.ema.module if self.ema else self.model
                 test_stats, coco_evaluator = evaluate(
                     module,
