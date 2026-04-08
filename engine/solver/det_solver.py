@@ -14,11 +14,13 @@ import time
 
 import numpy as np
 import torch
+from tqdm import tqdm
+
+from utils.async_reports import AsyncReportDispatcher
 
 from ..misc import dist_utils, stats
 from ..optim.lr_scheduler import FlatCosineLRScheduler
 from ._solver import BaseSolver
-from utils.async_reports import AsyncReportDispatcher
 from .det_engine import evaluate, train_one_epoch
 
 
@@ -219,7 +221,13 @@ class DetSolver(BaseSolver):
             async_report_dispatcher.start()
 
         try:
-            for epoch in range(start_epoch, args.epoches):
+            epoch_pbar = tqdm(
+                range(start_epoch, args.epoches),
+                desc="Training",
+                initial=start_epoch,
+                total=args.epoches,
+            )
+            for epoch in epoch_pbar:
 
                 self.train_dataloader.set_epoch(epoch)
                 # self.train_dataloader.dataset.set_epoch(epoch)
