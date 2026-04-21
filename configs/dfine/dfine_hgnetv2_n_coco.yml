@@ -22,7 +22,7 @@ HGNetv2:
 
 HybridEncoder:
   in_channels: [512, 1024]
-  feat_strides: [16, 32]g
+  feat_strides: [16, 32]
 
   # intra
   hidden_dim: 128
